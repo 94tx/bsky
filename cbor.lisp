@@ -16,6 +16,9 @@ Returns the deserialized data item and the next bit position."))
     (6 :tag)
     (7 :simple-or-float)))
 
+;; half-precision floating point converters
+(ieee-floats:make-float-converters %encode-float16 %decode-float-16 5 10 t)
+
 (-> %read-data-item (bit-vector integer &optional keyword) (values t number &optional))
 (defun %read-data-item (bits start &optional whence)
   "Read a single data item from BITS; starting at index START, optionally using scope WHENCE (for error reporting).
@@ -24,16 +27,20 @@ Returns the deserialized data item and the next bit position."
     (error "malformed stream during ~A~%incomplete data item header!" whence))
   (let ((position start)
         (whence whence))
-    (flet ((read-bits (count &key (lookahead nil))
+    (flet ((read-bits (count &key (lookahead nil) (return-integer t))
              (if (< (- (length bits) position) count)
                  (error "malformed stream during ~A~%ran out of bits to read!" whence)
                  (let ((slice (sera:slice bits position
                                           (if lookahead
                                               (+ position count)
                                               (incf position count)))))
-                   (sera:unbits slice :big-endian t)))))
+                   (if return-integer
+                       (sera:unbits slice :big-endian t)
+                       slice)))))
       (let ((major-type (read-bits 3))
             (short-count (read-bits 5)))
+        (declare (type (unsigned-byte 3) major-type)
+                 (type (unsigned-byte 5) short-count))
         (flet ((handle-count ()
                  (case short-count
                    (24 (read-bits 8))
@@ -61,33 +68,33 @@ Returns the deserialized data item and the next bit position."
                  (31 (let ((result (make-array 8 :initial-element 0
                                                  :fill-pointer 0
                                                  :adjustable t)))
-                      (loop with cont = t
-                            while cont
-                            do (if (= 255 (read-bits 8 :lookahead T))
-                                   (progn (incf position 8)
-                                          (setf cont nil))
-                                   (progn
-                                     (let ((inner-mt (read-bits 3 :lookahead T)))
-                                      (unless (= major-type inner-mt)
-                                        (error "malformed chunk during ~A; expected ~A, got ~A"
-                                               whence
-                                               (%major-type->keyword major-type)
-                                               (%major-type->keyword inner-mt))))
-                                     (multiple-value-bind (data newpos)
-                                         (%read-data-item bits position whence)
-                                       (declare (ignorable data))
-                                       (setf result (concatenate 'vector result data))
-                                       (setf position newpos)))))
+                       (loop with cont = t
+                             while cont
+                             do (if (= 255 (read-bits 8 :lookahead T))
+                                    (progn (incf position 8)
+                                           (setf cont nil))
+                                    (progn
+                                      (let ((inner-mt (read-bits 3 :lookahead T)))
+                                        (unless (= major-type inner-mt)
+                                          (error "malformed chunk during ~A; expected ~A, got ~A"
+                                                 whence
+                                                 (%major-type->keyword major-type)
+                                                 (%major-type->keyword inner-mt))))
+                                      (multiple-value-bind (data newpos)
+                                          (%read-data-item bits position whence)
+                                        (declare (ignorable data))
+                                        (setf result (concatenate 'vector result data))
+                                        (setf position newpos)))))
                        (values (if (= major-type 3)
                                    (concatenate 'string result)
                                    result)
                                position)))
                  (t (let ((data
-                       (map 'vector
-                            (lambda (i)
-                              (declare (ignore i))
-                              (read-bits 8))
-                            (alex:iota len))))
+                            (map 'vector
+                                 (lambda (i)
+                                   (declare (ignore i))
+                                   (read-bits 8))
+                                 (alex:iota len))))
                       (values (if (= major-type 3)
                                   (trivial-utf-8:utf-8-bytes-to-string data)
                                   data)
@@ -109,7 +116,6 @@ Returns the deserialized data item and the next bit position."
                                   (setf position newpos)
                                   (vector-push-extend data vector))))
                    (values vector position))
-                 
                  (let ((len (handle-count)))
                    (values (map 'vector
                                 (lambda (i)
@@ -122,28 +128,70 @@ Returns the deserialized data item and the next bit position."
                            position))))
             (5
              (setf whence :cbor.%read-data-item.map)
-             (if (= short-count 31)
-                 (progn
-                   (v:warn :cbor.%read-data-item "TODO: indefinite-length encoding"))
-                 (let ((count (handle-count))
-                       (table (make-hash-table :test 'equal)))
-                   (mapcar (lambda (i)
-                             (declare (ignore i))
-                             (let (key value)
-                               (multiple-value-bind (data newpos)
-                                   (%read-data-item
-                                    bits position :cbor.%read-data-item.map-key)
-                                 (setf position newpos
-                                       key data))
-                               (multiple-value-bind (data newpos)
-                                   (%read-data-item
-                                    bits position :cbor.%read-data-item.map-value)
-                                 (setf position newpos
-                                       value data))
-                               (sera:dict* table key value)))
-                           (alex:iota count))
-                   (values table position))))
-            (t (values nil position))))))))
+             (let ((table (make-hash-table :test 'equal)))
+               (if (= short-count 31)
+                   (loop with cont = t
+                         while cont
+                         do (if (= 255 (read-bits 8 :lookahead T))
+                                (progn
+                                  (incf position 8)
+                                  (setf cont nil))
+                                (let (key value)
+                                  (multiple-value-bind (data newpos)
+                                      (%read-data-item
+                                       bits position :cbor.%read-data-item.map-key)
+                                    (setf position newpos
+                                          key data))
+                                  (multiple-value-bind (data newpos)
+                                      (%read-data-item
+                                       bits position :cbor.%read-data-item.map-value)
+                                    (setf position newpos
+                                          value data))
+                                  (sera:dict* table key value))))
+                   (let ((count (handle-count)))
+                     (mapcar (lambda (i)
+                               (declare (ignore i))
+                               (let (key value)
+                                 (multiple-value-bind (data newpos)
+                                     (%read-data-item
+                                      bits position :cbor.%read-data-item.map-key)
+                                   (setf position newpos
+                                         key data))
+                                 (multiple-value-bind (data newpos)
+                                     (%read-data-item
+                                      bits position :cbor.%read-data-item.map-value)
+                                   (setf position newpos
+                                         value data))
+                                 (sera:dict* table key value)))
+                             (alex:iota count))))
+               (values table position)))
+            (6 (error "tagged values are unimplemented"))
+            (7
+             (cond
+               ((and (>= short-count 0)
+                     (<= short-count 23))
+                (ccase short-count
+                  ((0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19)
+                   (values (list :simple short-count) position))
+                  (20 (values nil position))
+                  (21 (values t position))
+                  (22 (values 'null position))
+                  (23 (values 'undefined position))))
+               ((= short-count 24)
+                (let ((value (read-bits 8)))
+                  (if (< value 32)
+                      (error "malformed value; extended simple value can't be less than 32")
+                      (values (list :simple value) position))))
+               ((= short-count 25)
+                (values (%decode-float-16 (read-bits 16)) position))
+               ((= short-count 26)
+                (values (ieee-floats:decode-float32 (read-bits 32)) position))
+               ((= short-count 27)
+                (values (ieee-floats:decode-float64 (read-bits 64)) position))
+               ((and (>= short-count 28)
+                     (<= short-count 30))
+                (error "reserved values 28-30 are malformed in RFC8949"))
+               (t (values nil position))))))))))
 
 (defmethod read-data-item ((data bit-vector) &optional (start 0))
   (%read-data-item data start))
