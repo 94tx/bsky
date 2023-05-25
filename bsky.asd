@@ -5,6 +5,7 @@
                :serapeum
                :verbose
                :bit-smasher
-               :trivial-utf-8)
+               :trivial-utf-8
+               :ieee-floats)
   :components ((:file "package")
                (:file "cbor")))
